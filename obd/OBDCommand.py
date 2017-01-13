@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 
 ########################################################################
 #                                                                      #
@@ -30,9 +31,12 @@
 ########################################################################
 
 from .utils import *
-from .debug import debug
 from .protocols import ECU
 from .OBDResponse import OBDResponse
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class OBDCommand():
@@ -62,29 +66,26 @@ class OBDCommand():
                           self.fast)
 
     @property
-    def mode_int(self):
-        if len(self.command) >= 2:
-            return unhex(self.command[:2])
+    def mode(self):
+        if len(self.command) >= 2 and \
+           isHex(self.command.decode()):
+            return int(self.command[:2], 16)
         else:
-            return 0
+            return None
 
     @property
-    def pid_int(self):
-        if len(self.command) > 2:
-            return unhex(self.command[2:])
+    def pid(self):
+        if len(self.command) > 2 and \
+           isHex(self.command.decode()):
+            return int(self.command[2:], 16)
         else:
-            return 0
+            return None
 
-    # TODO: remove later
-    @property
-    def supported(self):
-        debug("OBDCommand.supported is deprecated. Use OBD.supports() instead", True)
-        return False
 
     def __call__(self, messages):
 
         # filter for applicable messages (from the right ECU(s))
-        for_us = lambda m: self.ecu & m.ecu > 0
+        for_us = lambda m: (self.ecu & m.ecu) > 0
         messages = list(filter(for_us, messages))
 
         # guarantee data size for the decoder
@@ -95,7 +96,9 @@ class OBDCommand():
         # and reference to original command
         r = OBDResponse(self, messages)
         if messages:
-            r.value, r.unit = self.decode(messages)
+            r.value = self.decode(messages)
+        else:
+            logger.info(str(self) + " did not recieve any acceptable messages")
 
         return r
 
@@ -106,9 +109,11 @@ class OBDCommand():
             if len(message.data) > self.bytes:
                 # chop off the right side
                 message.data = message.data[:self.bytes]
-            else:
+                logger.debug("Message was longer than expected. Trimmed message: " + repr(message.data))
+            elif len(message.data) < self.bytes:
                 # pad the right with zeros
                 message.data += (b'\x00' * (self.bytes - len(message.data)))
+                logger.debug("Message was shorter than expected. Padded message: " + repr(message.data))
 
 
     def __str__(self):

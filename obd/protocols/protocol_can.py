@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 
 ########################################################################
 #                                                                      #
@@ -31,12 +32,17 @@
 
 from binascii import unhexlify
 from obd.utils import contiguous
-from .protocol import *
+from .protocol import Protocol, Message, Frame, ECU
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class CANProtocol(Protocol):
 
     TX_ID_ENGINE = 0
+    TX_ID_TRANSMISSION = 1
 
     FRAME_TYPE_SF = 0x00  # single frame
     FRAME_TYPE_FF = 0x10  # first frame of multi-frame message
@@ -64,19 +70,27 @@ class CANProtocol(Protocol):
         if self.id_bits == 11:
             raw = "00000" + raw
 
+        # Handle odd size frames and drop
+        if len(raw) & 1:
+            logger.debug("Dropping frame for being odd")
+            return False
+
         raw_bytes = bytearray(unhexlify(raw))
 
         # check for valid size
 
-        # TODO: lookup this limit
-        # if len(raw_bytes) < 9:
-        #     debug("Dropped frame for being too short")
-        #     return False
+        if len(raw_bytes) < 6:
+            # make sure that we have at least a PCI byte, and one following byte
+            # for FF frames with 12-bit length codes, or 1 byte of data
+            #
+            # 00 00 07 E8 10 20 ...
 
-        # TODO: lookup this limit
-        # if len(raw_bytes) > 16:
-        #     debug("Dropped frame for being too long")
-        #     return False
+            logger.debug("Dropped frame for being too short")
+            return False
+
+        if len(raw_bytes) > 12:
+            logger.debug("Dropped frame for being too long")
+            return False
 
 
         # read header information
@@ -119,7 +133,7 @@ class CANProtocol(Protocol):
         if frame.type not in [self.FRAME_TYPE_SF,
                               self.FRAME_TYPE_FF,
                               self.FRAME_TYPE_CF]:
-            debug("Dropping frame carrying unknown PCI frame type")
+            logger.debug("Dropping frame carrying unknown PCI frame type")
             return False
 
 
@@ -128,14 +142,26 @@ class CANProtocol(Protocol):
             #              v
             # 00 00 07 E8 06 41 00 BE 7F B8 13
             frame.data_len = frame.data[0] & 0x0F
+
+            # drop frames with no data
+            if frame.data_len == 0:
+                return False
+
         elif frame.type == self.FRAME_TYPE_FF:
             # First frames have 12 bit length codes
-            #              v
-            # 00 00 07 E8 06 41 00 BE 7F B8 13
+            #              v vv
+            # 00 00 07 E8 10 20 49 04 00 01 02 03
             frame.data_len = (frame.data[0] & 0x0F) << 8
             frame.data_len += frame.data[1]
+
+            # drop frames with no data
+            if frame.data_len == 0:
+                return False
+
         elif frame.type == self.FRAME_TYPE_CF:
             # Consecutive frames have 4 bit sequence indices
+            #              v
+            # 00 00 07 E8 21 04 05 06 07 08 09 0A
             frame.seq_index = frame.data[0] & 0x0F
 
         return True
@@ -149,7 +175,7 @@ class CANProtocol(Protocol):
             frame = frames[0]
 
             if frame.type != self.FRAME_TYPE_SF:
-                debug("Recieved lone frame not marked as single frame")
+                logger.debug("Recieved lone frame not marked as single frame")
                 return False
 
             # extract data, ignore PCI byte and anything after the marked length
@@ -170,19 +196,19 @@ class CANProtocol(Protocol):
                 elif f.type == self.FRAME_TYPE_CF:
                     cf.append(f)
                 else:
-                    debug("Dropping frame in multi-frame response not marked as FF or CF")
+                    logger.debug("Dropping frame in multi-frame response not marked as FF or CF")
 
             # check that we captured only one first-frame
             if len(ff) > 1:
-                debug("Recieved multiple frames marked FF")
+                logger.debug("Recieved multiple frames marked FF")
                 return False
             elif len(ff) == 0:
-                debug("Never received frame marked FF")
+                logger.debug("Never received frame marked FF")
                 return False
 
             # check that there was at least one consecutive-frame
             if len(cf) == 0:
-                debug("Never received frame marked CF")
+                logger.debug("Never received frame marked CF")
                 return False
 
             # calculate proper sequence indices from the lower 4 bits given
@@ -205,7 +231,7 @@ class CANProtocol(Protocol):
             # check contiguity, and that we aren't missing any frames
             indices = [f.seq_index for f in cf]
             if not contiguous(indices, 1, len(cf)):
-                debug("Recieved multiline response with missing frames")
+                logger.debug("Recieved multiline response with missing frames")
                 return False
 
 
@@ -240,29 +266,18 @@ class CANProtocol(Protocol):
             message.data = message.data[:ff[0].data_len]
 
 
-        # chop off the Mode/PID bytes based on the mode number
-        mode = message.data[0]
-        if mode == 0x43:
+        # trim DTC requests based on DTC count
+        # this ISN'T in the decoder because the legacy protocols
+        # don't provide a DTC_count bytes, and instead, insert a 0x00
+        # for consistency
 
-            # TODO: confirm this logic. I don't have any raw test data for it yet
+        if message.data[0] == 0x43:
+            #    []
+            # 43 03 11 11 22 22 33 33
+            #       [DTC] [DTC] [DTC]
 
-            # fetch the DTC count, and use it as a length code
-            num_dtc_bytes = message.data[1] * 2
-
-            # skip the PID byte and the DTC count,
-            message.data = message.data[2:][:num_dtc_bytes]
-
-        else:
-            # skip the Mode and PID bytes
-            #
-            # single line response:
-            #                      [  Data   ]
-            # 00 00 07 E8 06 41 00 BE 7F B8 13
-            #
-            # OR, the data from a multiline response:
-            #       [                     Data                       ]
-            # 49 04 01 35 36 30 32 38 39 34 39 41 43 00 00 00 00 00 00
-            message.data = message.data[2:]
+            num_dtc_bytes = message.data[1] * 2 # each DTC is 2 bytes
+            message.data = message.data[:(num_dtc_bytes + 2)] # add 2 to account for mode/DTC_count bytes
 
         return True
 
